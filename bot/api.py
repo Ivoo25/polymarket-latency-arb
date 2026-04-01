@@ -118,6 +118,7 @@ async def websocket_endpoint(ws: WebSocket):
 
 async def _broadcast_loop():
     """Push state to all connected WebSocket clients every second."""
+    global _ws_clients
     while True:
         if _ws_clients and engine:
             state = engine.get_dashboard_state()
