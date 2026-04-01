@@ -103,11 +103,8 @@ class ArbitrageEngine:
 
                     await self._execute_signal(signal, market)
 
-                # Scan every 3 seconds in sniper zone, 10s otherwise
-                now_ts = int(time.time())
-                secs_left = 300 - (now_ts - (now_ts // 300) * 300)
-                interval = 3.0 if secs_left <= 120 else 10.0
-                await asyncio.sleep(interval)
+                # Scan every 2 seconds — latency arb needs speed
+                await asyncio.sleep(2.0)
 
             except Exception as e:
                 logger.error(f"Trading loop error: {e}", exc_info=True)
