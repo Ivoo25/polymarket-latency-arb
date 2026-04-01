@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 import logging
 from typing import Optional
@@ -8,8 +9,8 @@ import httpx
 
 logger = logging.getLogger("arb.polymarket")
 
-POLYMARKET_API = "https://clob.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
+CLOB_API = "https://clob.polymarket.com"
 
 
 @dataclass
@@ -17,20 +18,18 @@ class Market:
     condition_id: str
     question: str
     asset: str  # BTC or ETH
-    contract_type: str  # 5min or 15min
+    contract_type: str  # 5min
     yes_price: float
     no_price: float
     end_time: float
     token_id_yes: str
     token_id_no: str
+    slug: str = ""
     active: bool = True
 
 
 class PolymarketClient:
-    """Fetches active short-duration crypto markets and places trades."""
-
-    CRYPTO_KEYWORDS = ["Bitcoin", "BTC", "Ethereum", "ETH"]
-    DURATION_KEYWORDS = ["5 minute", "5-minute", "15 minute", "15-minute", "5min", "15min"]
+    """Fetches active 5-minute BTC/ETH up/down markets from Polymarket."""
 
     def __init__(self, api_key: str = "", secret: str = "", passphrase: str = "", private_key: str = ""):
         self.api_key = api_key
@@ -38,11 +37,11 @@ class PolymarketClient:
         self.passphrase = passphrase
         self.private_key = private_key
         self._client = httpx.AsyncClient(timeout=10)
-        self._rate_limit = asyncio.Semaphore(5)  # max 5 concurrent requests
+        self._rate_limit = asyncio.Semaphore(5)
         self._last_request = 0.0
-        self._min_interval = 0.2  # 200ms between requests
+        self._min_interval = 0.2
 
-    async def _request(self, method: str, url: str, **kwargs) -> dict:
+    async def _request(self, method: str, url: str, **kwargs) -> dict | list:
         async with self._rate_limit:
             elapsed = time.time() - self._last_request
             if elapsed < self._min_interval:
@@ -67,72 +66,117 @@ class PolymarketClient:
             return {}
 
     async def get_active_markets(self) -> list[Market]:
-        """Fetch active short-duration BTC/ETH up/down markets."""
+        """Fetch current and next 5-minute BTC up/down markets by slug."""
         markets = []
-        try:
-            data = await self._request("GET", f"{GAMMA_API}/markets", params={
-                "active": "true",
-                "closed": "false",
-                "limit": 100,
-            })
-            if not isinstance(data, list):
-                data = data.get("data", []) if isinstance(data, dict) else []
+        now_ts = int(time.time())
 
-            now = time.time()
-            for m in data:
-                question = m.get("question", "")
-                is_crypto = any(kw.lower() in question.lower() for kw in self.CRYPTO_KEYWORDS)
-                is_short = any(kw.lower() in question.lower() for kw in self.DURATION_KEYWORDS)
+        # Current 5-min window
+        current_window = (now_ts // 300) * 300
+        seconds_left = 300 - (now_ts - current_window)
 
-                if not (is_crypto and is_short):
-                    continue
+        # Fetch current window market
+        slugs = [f"btc-updown-5m-{current_window}"]
 
-                asset = "BTC" if any(k in question for k in ["Bitcoin", "BTC"]) else "ETH"
-                ctype = "5min" if "5" in question.split("minute")[0].split("min")[0][-2:] else "15min"
+        # Also fetch next window if current is about to expire
+        if seconds_left < 60:
+            next_window = current_window + 300
+            slugs.append(f"btc-updown-5m-{next_window}")
 
-                tokens = m.get("tokens", [])
-                if len(tokens) < 2:
-                    continue
+        for slug in slugs:
+            market = await self._fetch_market_by_slug(slug, seconds_left if slug == slugs[0] else 300)
+            if market:
+                markets.append(market)
 
-                yes_token = tokens[0] if tokens[0].get("outcome") == "Yes" else tokens[1]
-                no_token = tokens[1] if tokens[0].get("outcome") == "Yes" else tokens[0]
-
-                end_ts = m.get("end_date_iso")
-                if end_ts:
-                    from datetime import datetime
-                    try:
-                        end_time = datetime.fromisoformat(end_ts.replace("Z", "+00:00")).timestamp()
-                    except (ValueError, TypeError):
-                        end_time = now + 900
-                else:
-                    end_time = now + 900
-
-                markets.append(Market(
-                    condition_id=m.get("condition_id", ""),
-                    question=question,
-                    asset=asset,
-                    contract_type=ctype,
-                    yes_price=float(yes_token.get("price", 0.5)),
-                    no_price=float(no_token.get("price", 0.5)),
-                    end_time=end_time,
-                    token_id_yes=yes_token.get("token_id", ""),
-                    token_id_no=no_token.get("token_id", ""),
-                ))
-        except Exception as e:
-            logger.error(f"Failed to fetch markets: {e}")
+        if markets:
+            for mk in markets:
+                logger.info(
+                    f"[MARKET] {mk.question[:60]} | UP={mk.yes_price:.3f} DOWN={mk.no_price:.3f} | "
+                    f"{int(mk.end_time - time.time())}s left"
+                )
+        else:
+            logger.debug("No active 5m BTC markets found")
 
         return markets
+
+    async def _fetch_market_by_slug(self, slug: str, seconds_left: int) -> Optional[Market]:
+        """Fetch a specific market by its slug from Gamma API."""
+        try:
+            data = await self._request("GET", f"{GAMMA_API}/events", params={"slug": slug})
+
+            if not data or not isinstance(data, list) or len(data) == 0:
+                return None
+
+            event = data[0]
+            event_markets = event.get("markets", [])
+            if not event_markets:
+                return None
+
+            m = event_markets[0]
+            prices_raw = m.get("outcomePrices", "[0.5,0.5]")
+            tokens_raw = m.get("clobTokenIds", '["",""]')
+
+            prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+            tokens = json.loads(tokens_raw) if isinstance(tokens_raw, str) else tokens_raw
+
+            yes_price = float(prices[0]) if len(prices) > 0 else 0.5
+            no_price = float(prices[1]) if len(prices) > 1 else 0.5
+            token_yes = tokens[0] if len(tokens) > 0 else ""
+            token_no = tokens[1] if len(tokens) > 1 else ""
+
+            # Try to get more accurate CLOB prices
+            clob_yes, clob_no = await self._get_clob_prices(token_yes, token_no)
+            if clob_yes is not None:
+                yes_price = clob_yes
+            if clob_no is not None:
+                no_price = clob_no
+
+            end_time = time.time() + seconds_left
+
+            return Market(
+                condition_id=m.get("conditionId", m.get("id", "")),
+                question=event.get("title", m.get("question", "")),
+                asset="BTC",
+                contract_type="5min",
+                yes_price=yes_price,
+                no_price=no_price,
+                end_time=end_time,
+                token_id_yes=token_yes,
+                token_id_no=token_no,
+                slug=slug,
+            )
+        except Exception as e:
+            logger.error(f"Failed to fetch market {slug}: {e}")
+            return None
+
+    async def _get_clob_prices(self, token_yes: str, token_no: str) -> tuple[Optional[float], Optional[float]]:
+        """Get real-time CLOB prices (more accurate than Gamma cache)."""
+        clob_yes = None
+        clob_no = None
+        try:
+            if token_yes:
+                data = await self._request("GET", f"{CLOB_API}/price", params={"token_id": token_yes, "side": "BUY"})
+                if isinstance(data, dict) and "price" in data:
+                    p = float(data["price"])
+                    if 0.01 < p < 0.99:
+                        clob_yes = p
+            if token_no:
+                data = await self._request("GET", f"{CLOB_API}/price", params={"token_id": token_no, "side": "BUY"})
+                if isinstance(data, dict) and "price" in data:
+                    p = float(data["price"])
+                    if 0.01 < p < 0.99:
+                        clob_no = p
+        except Exception as e:
+            logger.debug(f"CLOB price fetch failed: {e}")
+        return clob_yes, clob_no
 
     async def place_order(self, token_id: str, side: str, size: float, price: float) -> Optional[str]:
         """Place an order on Polymarket CLOB. Returns order ID or None."""
         if not self.api_key:
-            logger.warning("No API key configured — cannot place live orders")
+            logger.warning("No API key — cannot place live orders")
             return None
 
         try:
-            # Using py-clob-client would go here for live trading
-            # For now, log the intent
-            logger.info(f"ORDER: {side} {size:.2f} USDC @ {price:.4f} on {token_id}")
+            logger.info(f"ORDER: {side} {size:.2f} USDC @ {price:.4f} on {token_id[:20]}...")
             return f"paper_{int(time.time() * 1000)}"
         except Exception as e:
             logger.error(f"Order placement failed: {e}")

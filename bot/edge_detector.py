@@ -4,6 +4,8 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
+import httpx
+
 logger = logging.getLogger("arb.edge")
 
 
@@ -26,7 +28,11 @@ class Signal:
 
 
 class EdgeDetector:
-    """Detects latency arbitrage opportunities between Binance and Polymarket."""
+    """
+    Detects latency arbitrage: compares Binance real-time BTC price
+    against the 5-min candle open to determine direction, then checks
+    if Polymarket odds are lagging behind reality.
+    """
 
     def __init__(self, min_edge: float = 0.05, min_confidence: float = 0.85):
         self.min_edge = min_edge
@@ -34,98 +40,125 @@ class EdgeDetector:
         self._price_history: dict[str, list[tuple[float, float]]] = {
             "BTC": [], "ETH": []
         }
-        self.MAX_HISTORY = 300  # 5 minutes of second-level data
+        self.MAX_HISTORY = 600
+        self._candle_open: dict[str, float] = {}  # BTC/ETH candle open prices
+        self._last_candle_fetch = 0.0
 
     def update_price(self, asset: str, price: float, ts: float):
         history = self._price_history.get(asset, [])
         history.append((ts, price))
-        # Keep last N entries
         if len(history) > self.MAX_HISTORY:
             history = history[-self.MAX_HISTORY:]
         self._price_history[asset] = history
 
-    def _calculate_momentum(self, asset: str, window_seconds: float = 30.0) -> Optional[float]:
-        """Calculate recent price momentum as percentage change over window."""
-        history = self._price_history.get(asset, [])
-        if len(history) < 10:
-            return None
+    async def fetch_candle_open(self, asset: str = "BTC"):
+        """Fetch the opening price of the current 5-min candle from Binance."""
+        now = time.time()
+        # Only fetch every 5 seconds max
+        if now - self._last_candle_fetch < 5:
+            return
 
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                symbol = f"{asset}USDT"
+                resp = await client.get(
+                    f"https://api.binance.com/api/v3/klines",
+                    params={"symbol": symbol, "interval": "5m", "limit": 1}
+                )
+                data = resp.json()
+                if data and len(data) > 0:
+                    candle_open = float(data[0][1])
+                    self._candle_open[asset] = candle_open
+                    self._last_candle_fetch = now
+        except Exception as e:
+            logger.debug(f"Candle fetch error: {e}")
+
+    def _get_current_price(self, asset: str) -> Optional[float]:
+        history = self._price_history.get(asset, [])
+        if not history:
+            return None
+        return history[-1][1]
+
+    def _calculate_momentum(self, asset: str, window_seconds: float = 15.0) -> Optional[float]:
+        """Short-window momentum for confidence scoring."""
+        history = self._price_history.get(asset, [])
+        if len(history) < 5:
+            return None
         now = history[-1][0]
         cutoff = now - window_seconds
-
-        window_prices = [(t, p) for t, p in history if t >= cutoff]
-        if len(window_prices) < 5:
+        window = [(t, p) for t, p in history if t >= cutoff]
+        if len(window) < 3:
             return None
-
-        start_price = window_prices[0][1]
-        end_price = window_prices[-1][1]
-
-        if start_price == 0:
-            return None
-
-        return (end_price - start_price) / start_price
-
-    def _estimate_direction_probability(self, momentum: float, seconds_to_expiry: float) -> tuple[str, float]:
-        """
-        Estimate probability that price will be higher/lower at expiry
-        based on current momentum and time remaining.
-        """
-        # Strong momentum with little time left = high confidence
-        # The closer to expiry, the more predictive current momentum is
-        time_factor = max(0.1, min(1.0, 1.0 - (seconds_to_expiry / 900.0)))
-
-        # Absolute momentum strength
-        abs_mom = abs(momentum)
-
-        # Base probability from momentum
-        if abs_mom < 0.0001:
-            return "UP", 0.50
-
-        # Sigmoid-like mapping: stronger momentum = higher probability
-        raw_prob = 0.5 + 0.5 * math.tanh(abs_mom * 500 * time_factor)
-        raw_prob = min(0.99, max(0.51, raw_prob))
-
-        direction = "UP" if momentum > 0 else "DOWN"
-        return direction, raw_prob
+        return (window[-1][1] - window[0][1]) / window[0][1]
 
     def detect(self, asset: str, market) -> Optional[Signal]:
-        """Check if there's an exploitable edge on this market."""
+        """
+        Core logic: compare current BTC price vs candle open.
+        If BTC has moved significantly and Polymarket odds haven't caught up,
+        that's our edge.
+        """
         now = time.time()
         seconds_to_expiry = market.end_time - now
 
-        # Don't trade markets about to expire (< 30s) or too far out (> 14min)
-        if seconds_to_expiry < 30 or seconds_to_expiry > 840:
+        # Only trade when <= 120s left (sniper zone) and > 15s (need time to settle)
+        if seconds_to_expiry > 120 or seconds_to_expiry < 15:
             return None
 
-        momentum = self._calculate_momentum(asset)
-        if momentum is None:
+        current_price = self._get_current_price(asset)
+        candle_open = self._candle_open.get(asset)
+
+        if not current_price or not candle_open or candle_open == 0:
             return None
 
-        direction, true_prob = self._estimate_direction_probability(momentum, seconds_to_expiry)
+        # Price difference from candle open
+        diff_pct = (current_price - candle_open) / candle_open
+        diff_abs = abs(current_price - candle_open)
 
-        # What Polymarket currently implies
-        if direction == "UP":
-            poly_price = market.yes_price  # YES = price goes up
+        # Need meaningful price movement (at least $20 for BTC)
+        if diff_abs < 20:
+            return None
+
+        # Determine direction based on price reality
+        if current_price > candle_open:
+            direction = "UP"
+            # True probability that BTC will be UP at close (it already IS up)
+            # Closer to expiry + bigger move = higher certainty
+            time_factor = max(0.3, 1.0 - (seconds_to_expiry / 300.0))
+            true_prob = 0.5 + 0.45 * math.tanh(abs(diff_pct) * 300) * time_factor
+            poly_price = market.yes_price
             token_id = market.token_id_yes
             side = "YES"
         else:
-            poly_price = market.no_price  # NO = price goes down (or YES on "down" market)
+            direction = "DOWN"
+            time_factor = max(0.3, 1.0 - (seconds_to_expiry / 300.0))
+            true_prob = 0.5 + 0.45 * math.tanh(abs(diff_pct) * 300) * time_factor
+            poly_price = market.no_price
             token_id = market.token_id_no
             side = "NO"
 
-        # Edge = true probability - market price
+        true_prob = min(0.98, true_prob)
+
+        # Edge = our estimated probability - what Polymarket charges
         edge = true_prob - poly_price
 
         if edge < self.min_edge:
             return None
 
-        # Confidence combines probability strength and edge size
-        confidence = min(0.99, true_prob * (1.0 + edge))
+        # Momentum confirmation (is price still moving in our direction?)
+        momentum = self._calculate_momentum(asset, window_seconds=10)
+        if momentum is not None:
+            if direction == "UP" and momentum < -0.0001:
+                logger.debug(f"Momentum reversal: betting UP but price dropping")
+                return None
+            if direction == "DOWN" and momentum > 0.0001:
+                logger.debug(f"Momentum reversal: betting DOWN but price rising")
+                return None
+
+        # Confidence = combination of edge size, time proximity, and price movement
+        confidence = min(0.98, true_prob * (1.0 + edge * 0.5))
 
         if confidence < self.min_confidence:
             return None
-
-        current_price = self._price_history[asset][-1][1] if self._price_history[asset] else 0.0
 
         signal = Signal(
             market_id=market.condition_id,
@@ -145,8 +178,10 @@ class EdgeDetector:
         )
 
         logger.info(
-            f"SIGNAL: {asset} {direction} | edge={edge:.2%} conf={confidence:.2%} "
-            f"| poly={poly_price:.4f} true_prob={true_prob:.4f} | expires in {seconds_to_expiry:.0f}s"
+            f"SIGNAL: {asset} {direction} | BTC=${current_price:.0f} open=${candle_open:.0f} "
+            f"diff=${diff_abs:.0f} ({diff_pct:+.3%}) | "
+            f"edge={edge:.2%} conf={confidence:.2%} poly={poly_price:.3f} true={true_prob:.3f} | "
+            f"{seconds_to_expiry:.0f}s left"
         )
 
         return signal

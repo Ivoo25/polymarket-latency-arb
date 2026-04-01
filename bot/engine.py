@@ -38,7 +38,7 @@ class ArbitrageEngine:
         )
 
         self._running = False
-        self._scan_interval = 2.0  # seconds between market scans
+        self._scan_interval = 10.0  # seconds between market scans (avoid hammering API)
         self._snapshot_interval = 300  # 5 min snapshots
         self._last_snapshot = 0.0
         self._last_daily_reset = 0.0
@@ -87,6 +87,10 @@ class ArbitrageEngine:
                     continue
 
                 self.status = "scanning"
+
+                # Fetch candle open price for edge detection
+                await self.edge_detector.fetch_candle_open("BTC")
+
                 markets = await self.polymarket.get_active_markets()
 
                 for market in markets:
@@ -99,7 +103,11 @@ class ArbitrageEngine:
 
                     await self._execute_signal(signal, market)
 
-                await asyncio.sleep(self._scan_interval)
+                # Scan every 3 seconds in sniper zone, 10s otherwise
+                now_ts = int(time.time())
+                secs_left = 300 - (now_ts - (now_ts // 300) * 300)
+                interval = 3.0 if secs_left <= 120 else 10.0
+                await asyncio.sleep(interval)
 
             except Exception as e:
                 logger.error(f"Trading loop error: {e}", exc_info=True)
