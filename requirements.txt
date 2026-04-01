@@ -1,0 +1,11 @@
+websockets>=12.0
+aiohttp>=3.9
+py-clob-client>=0.15
+python-dotenv>=1.0
+fastapi>=0.109
+uvicorn[standard]>=0.27
+sqlalchemy>=2.0
+aiosqlite>=0.19
+web3>=6.15
+httpx>=0.27
+rich>=13.7
