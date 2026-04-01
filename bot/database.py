@@ -102,6 +102,13 @@ class Database:
                 WHERE id = ?
             """, (exit_price, pnl, int(won), trade_id))
 
+    def get_open_trades(self) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM trades WHERE resolved = 0 ORDER BY timestamp ASC"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
     def get_recent_trades(self, limit: int = 10) -> list[dict]:
         with self._conn() as conn:
             rows = conn.execute(
